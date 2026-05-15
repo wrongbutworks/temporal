@@ -68,6 +68,7 @@ var scenarios = []omesScenario{
 		options: []string{
 			"internal-iterations=10",
 			"nexus-endpoint=" + nexusEndpoint,
+			"include-standalone-nexus=true",
 		},
 	},
 	{
@@ -128,11 +129,20 @@ func TestMixedBrain(t *testing.T) {
 	var proxy *frontendProxy
 	runID := fmt.Sprintf("mixed-brain-%d", time.Now().Unix())
 
+	// Standalone Nexus is a current-only feature. Enabling it on the current
+	// server lets omes exercise the StartNexusOperationExecution RPC; requests
+	// that the proxy routes to the release server come back with Unimplemented,
+	// which the omes scenario tolerates as a no-op.
+	currentDC := map[string]any{
+		"nexusoperation.enableStandalone": true,
+	}
+
 	t.Run("start current server", func(st *testing.T) {
 		// Server processes use the parent t so their context survives this sub-test.
 		currentSrv, currentLogFile = startDevServer(t, "current", currentLog, devserver.Options{
-			SourceDir:   sourceRoot(),
-			Persistence: persistence,
+			SourceDir:           sourceRoot(),
+			Persistence:         persistence,
+			DynamicConfigValues: currentDC,
 		})
 
 		var err error
@@ -178,6 +188,7 @@ func TestMixedBrain(t *testing.T) {
 		createNexusEndpoint(st, conn, nexusEndpoint, throughput.namespace, "omes-"+runID+"-"+throughput.name)
 
 		proxy = startFrontendProxy(st, currentSrv.FrontendHostPort(), releaseSrv.FrontendHostPort())
+		st.Cleanup(proxy.stop)
 
 		for _, scenario := range scenarios {
 			st.Run(scenario.name, func(sst *testing.T) {
@@ -190,7 +201,6 @@ func TestMixedBrain(t *testing.T) {
 	if t.Failed() {
 		return
 	}
-	t.Cleanup(proxy.stop)
 
 	t.Run("verify", func(st *testing.T) {
 		requireServerAlive(st, "current", currentSrv.FrontendHostPort())

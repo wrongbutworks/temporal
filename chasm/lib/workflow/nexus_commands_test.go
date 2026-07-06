@@ -54,16 +54,21 @@ func (tcx *testContext) setHasAnyBufferedEvent(value bool) {
 }
 
 var defaultConfig = &nexusoperation.Config{
-	EnableChasmNexusWorkflowOperations: dynamicconfig.GetBoolPropertyFnFilteredByNamespace(true),
-	MaxServiceNameLength:               dynamicconfig.GetIntPropertyFnFilteredByNamespace(len("service")),
-	MaxOperationNameLength:             dynamicconfig.GetIntPropertyFnFilteredByNamespace(len("op")),
-	MaxConcurrentOperationsPerWorkflow: dynamicconfig.GetIntPropertyFnFilteredByNamespace(2),
-	MaxOperationHeaderSize:             dynamicconfig.GetIntPropertyFnFilteredByNamespace(20),
-	DisallowedOperationHeaders:         dynamicconfig.GetTypedPropertyFn([]string{"request-timeout"}),
-	MaxOperationScheduleToCloseTimeout: dynamicconfig.GetDurationPropertyFnFilteredByNamespace(time.Hour * 24),
+	EnableChasmNexusWorkflowOperations:         dynamicconfig.GetBoolPropertyFnFilteredByNamespace(true),
+	ChasmNexusWorkflowOperationsRolloutPercent: dynamicconfig.GetIntPropertyFnFilteredByNamespace(100),
+	MaxServiceNameLength:                       dynamicconfig.GetIntPropertyFnFilteredByNamespace(len("service")),
+	MaxOperationNameLength:                     dynamicconfig.GetIntPropertyFnFilteredByNamespace(len("op")),
+	MaxConcurrentOperationsPerWorkflow:         dynamicconfig.GetIntPropertyFnFilteredByNamespace(2),
+	MaxOperationHeaderSize:                     dynamicconfig.GetIntPropertyFnFilteredByNamespace(20),
+	DisallowedOperationHeaders:                 dynamicconfig.GetTypedPropertyFn([]string{"request-timeout"}),
+	MaxOperationScheduleToCloseTimeout:         dynamicconfig.GetDurationPropertyFnFilteredByNamespace(time.Hour * 24),
 }
 
-func newTestContext(t *testing.T, cfg *nexusoperation.Config) testContext {
+func newTestContext(t *testing.T, cfg *nexusoperation.Config, workflowID ...string) testContext {
+	wfID := ""
+	if len(workflowID) > 0 {
+		wfID = workflowID[0]
+	}
 	endpointReg := nexustest.FakeEndpointRegistry{
 		OnGetByName: func(ctx context.Context, namespaceID namespace.ID, endpointName string) (*persistencespb.NexusEndpointEntry, error) {
 			if endpointName == "endpoint caller namespace unauthorized" {
@@ -113,6 +118,7 @@ func newTestContext(t *testing.T, cfg *nexusoperation.Config) testContext {
 			HandleExecutionKey: func() chasm.ExecutionKey {
 				return chasm.ExecutionKey{
 					NamespaceID: tests.GlobalNamespaceEntry.ID().String(),
+					BusinessID:  wfID,
 				}
 			},
 			GoCtx: context.WithValue(context.Background(), nexusoperation.OperationContextKey, &nexusoperation.OperationContext{MetricTagConfig: dynamicconfig.GetTypedPropertyFn(nexusoperation.NexusMetricTagConfig{})}),
@@ -148,6 +154,69 @@ func TestHandleScheduleCommand(t *testing.T) {
 		err := tcx.scheduleHandler(tcx.chasmCtx, tcx.wf, commandValidator{maxPayloadSize: 1}, &commandpb.Command{}, CommandHandlerOptions{WorkflowTaskCompletedEventID: 1})
 		require.ErrorIs(t, err, ErrCommandNotSupported)
 		require.Empty(t, tcx.history.Events)
+	})
+
+	validScheduleCmd := &commandpb.Command{
+		Attributes: &commandpb.Command_ScheduleNexusOperationCommandAttributes{
+			ScheduleNexusOperationCommandAttributes: &commandpb.ScheduleNexusOperationCommandAttributes{
+				Endpoint:  "endpoint",
+				Service:   "service",
+				Operation: "op",
+			},
+		},
+	}
+
+	t.Run("rollout percent 0 routes all operations to HSM", func(t *testing.T) {
+		cfg := *defaultConfig
+		cfg.ChasmNexusWorkflowOperationsRolloutPercent = dynamicconfig.GetIntPropertyFnFilteredByNamespace(0)
+		tcx := newTestContext(t, &cfg, "any-workflow")
+		err := tcx.scheduleHandler(tcx.chasmCtx, tcx.wf, commandValidator{maxPayloadSize: 1}, validScheduleCmd, CommandHandlerOptions{WorkflowTaskCompletedEventID: 1})
+		require.ErrorIs(t, err, ErrCommandNotSupported)
+		require.Empty(t, tcx.history.Events)
+	})
+
+	t.Run("rollout percent 100 routes all operations to CHASM", func(t *testing.T) {
+		cfg := *defaultConfig
+		cfg.ChasmNexusWorkflowOperationsRolloutPercent = dynamicconfig.GetIntPropertyFnFilteredByNamespace(100)
+		tcx := newTestContext(t, &cfg, "any-workflow")
+		err := tcx.scheduleHandler(tcx.chasmCtx, tcx.wf, commandValidator{maxPayloadSize: 1}, validScheduleCmd, CommandHandlerOptions{WorkflowTaskCompletedEventID: 1})
+		require.NoError(t, err)
+		require.Len(t, tcx.history.Events, 1)
+	})
+
+	t.Run("rollout percent partitions stably by workflow id", func(t *testing.T) {
+		nsName := tests.GlobalNamespaceEntry.Name().String()
+		const percent = 50
+
+		// Find one workflow ID inside the rollout and one outside, using the exact same key
+		// construction as the handler so the test tracks the production hashing.
+		var insideID, outsideID string
+		for i := 0; insideID == "" || outsideID == ""; i++ {
+			require.Less(t, i, 1000, "could not find both an inside and an outside workflow id")
+			id := fmt.Sprintf("wf-%d", i)
+			key := fmt.Appendf(nil, "%s\x00%s", nsName, id)
+			if dynamicconfig.RolloutAccepts(key, percent) {
+				if insideID == "" {
+					insideID = id
+				}
+			} else if outsideID == "" {
+				outsideID = id
+			}
+		}
+
+		cfg := *defaultConfig
+		cfg.ChasmNexusWorkflowOperationsRolloutPercent = dynamicconfig.GetIntPropertyFnFilteredByNamespace(percent)
+
+		scheduleFor := func(workflowID string) error {
+			tcx := newTestContext(t, &cfg, workflowID)
+			return tcx.scheduleHandler(tcx.chasmCtx, tcx.wf, commandValidator{maxPayloadSize: 1}, validScheduleCmd, CommandHandlerOptions{WorkflowTaskCompletedEventID: 1})
+		}
+
+		// The decision must be stable for a given workflow across repeated command handling.
+		for range 3 {
+			require.NoError(t, scheduleFor(insideID), "workflow inside the rollout must route to CHASM")
+			require.ErrorIs(t, scheduleFor(outsideID), ErrCommandNotSupported, "workflow outside the rollout must fall back to HSM")
+		}
 	})
 
 	t.Run("empty attributes", func(t *testing.T) {

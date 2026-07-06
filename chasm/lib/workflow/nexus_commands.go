@@ -14,6 +14,7 @@ import (
 	"go.temporal.io/api/serviceerror"
 	"go.temporal.io/server/chasm"
 	"go.temporal.io/server/chasm/lib/nexusoperation"
+	"go.temporal.io/server/common/dynamicconfig"
 	commonnexus "go.temporal.io/server/common/nexus"
 	"go.temporal.io/server/common/primitives/timestamp"
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -35,7 +36,16 @@ func (ch *nexusCommandHandler) handleScheduleCommand(
 	ns := ctx.NamespaceEntry()
 	nsName := ns.Name().String()
 
+	// Route new operations to the CHASM tree only when the namespace boolean flag is on AND this workflow falls within
+	// the intra-namespace rollout percentage. Membership is a stable hash of namespace + workflow ID so a given workflow
+	// consistently lands on the same implementation across all of its operations (never flipping an in-flight workflow's
+	// rail), and dialing the percentage up is monotonic. When the flag is off or the workflow is outside the rollout, we
+	// return ErrCommandNotSupported so the operation is created in the HSM tree instead.
 	if !ch.config.EnableChasmNexusWorkflowOperations(nsName) {
+		return ErrCommandNotSupported
+	}
+	rolloutKey := fmt.Appendf(nil, "%s\x00%s", nsName, ctx.ExecutionKey().BusinessID)
+	if !dynamicconfig.RolloutAccepts(rolloutKey, ch.config.ChasmNexusWorkflowOperationsRolloutPercent(nsName)) {
 		return ErrCommandNotSupported
 	}
 

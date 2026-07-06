@@ -65,11 +65,18 @@ func TestNexusWorkflowTestSuiteCHASM(t *testing.T) {
 }
 
 func (s *NexusWorkflowTestSuite) newTestEnv(chasmEnabled bool, opts ...testcore.TestOption) *NexusTestEnv {
+	// The rollout percent defaults to 0, so enabling the boolean flag alone routes nothing to CHASM. Dial it up to
+	// 100 in the CHASM suite so all operations are created on the CHASM tree.
+	rolloutPercent := 0
+	if chasmEnabled {
+		rolloutPercent = 100
+	}
 	return newNexusTestEnv(s.T(), true, append(
 		opts,
 		testcore.WithDynamicConfig(dynamicconfig.EnableChasm, chasmEnabled),
 		testcore.WithDynamicConfig(dynamicconfig.EnableCHASMCallbacks, chasmEnabled),
 		testcore.WithDynamicConfig(chasmnexus.EnableChasmWorkflowOperations, chasmEnabled),
+		testcore.WithDynamicConfig(chasmnexus.ChasmWorkflowOperationsRolloutPercent, rolloutPercent),
 	)...)
 }
 

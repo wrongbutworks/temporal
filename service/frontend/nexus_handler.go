@@ -58,6 +58,7 @@ type nexusContext struct {
 	claims                               *authorization.Claims
 	namespaceValidationInterceptor       *interceptor.NamespaceValidatorInterceptor
 	namespaceRateLimitInterceptor        interceptor.NamespaceRateLimitInterceptor
+	tenantRateLimitInterceptor           interceptor.TenantRateLimitInterceptor
 	namespaceConcurrencyLimitInterceptor *interceptor.ConcurrentRequestLimitInterceptor
 	rateLimitInterceptor                 *interceptor.RateLimitInterceptor
 	responseHeaders                      map[string]string
@@ -221,6 +222,11 @@ func (c *operationContext) interceptRequest(
 			}
 		}
 	})
+
+	if err := c.tenantRateLimitInterceptor.Allow(c.namespace, c.apiName, header); err != nil {
+		c.metricsHandler = c.metricsHandler.WithTags(metrics.OutcomeTag("tenant_rate_limited"))
+		return commonnexus.ConvertGRPCError(err, true)
+	}
 
 	cleanup, err := c.namespaceConcurrencyLimitInterceptor.Allow(
 		c.namespace.Name(),

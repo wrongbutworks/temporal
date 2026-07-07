@@ -48,6 +48,7 @@ type (
 		AutoEnableV2Sub                          dynamicconfig.TypedSubscribableWithTaskQueueFilter[bool]
 		GetTasksBatchSize                        dynamicconfig.IntPropertyFnWithTaskQueueFilter
 		GetTasksReloadAt                         dynamicconfig.IntPropertyFnWithTaskQueueFilter
+		ForceReadTasksOnWrite                    dynamicconfig.BoolPropertyFnWithTaskQueueFilter
 		UpdateAckInterval                        dynamicconfig.DurationPropertyFnWithTaskQueueFilter
 		MetadataUpdateOnAppendInterval           dynamicconfig.DurationPropertyFnWithTaskQueueFilter
 		MaxTaskQueueIdleTime                     dynamicconfig.DurationPropertyFnWithTaskQueueFilter
@@ -95,6 +96,8 @@ type (
 		TaskQueueInfoByBuildIdTTL                dynamicconfig.DurationPropertyFnWithTaskQueueFilter
 		PriorityLevels                           dynamicconfig.IntPropertyFnWithTaskQueueFilter
 
+		RateLimitFractionProvider TaskQueueRateLimitFractionProvider
+
 		RateLimiterRefreshInterval    time.Duration
 		FairnessKeyRateLimitCacheSize dynamicconfig.IntPropertyFnWithTaskQueueFilter
 		MaxFairnessKeyWeightOverrides dynamicconfig.IntPropertyFnWithTaskQueueFilter
@@ -136,6 +139,7 @@ type (
 		PollerScalingDecisionsPerSecond dynamicconfig.FloatPropertyFnWithTaskQueueFilter
 
 		FairnessCounter               dynamicconfig.TypedPropertyFnWithTaskQueueFilter[counter.CounterParams]
+		FairnessPassDither            dynamicconfig.BoolPropertyFnWithTaskQueueFilter
 		PartitionScaleAllowedDrift    dynamicconfig.TypedPropertyFnWithTaskQueueFilter[dynamicconfig.PartitionScaleAllowedDrift]
 		PartitionScaleManagerSettings dynamicconfig.TypedPropertyFnWithTaskQueueFilter[dynamicconfig.PartitionScaleManagerSettings]
 
@@ -174,6 +178,7 @@ type (
 		AutoEnableV2Sub                func(func(bool)) (bool, func())
 		GetTasksBatchSize              func() int
 		GetTasksReloadAt               func() int
+		ForceReadTasksOnWrite          func() bool
 		UpdateAckInterval              func() time.Duration
 		MetadataUpdateOnAppendInterval func() time.Duration
 		MaxTaskQueueIdleTime           func() time.Duration
@@ -211,6 +216,7 @@ type (
 		MaxVersionsInTaskQueue    func() int
 
 		// Rate limiting
+		RateLimitFraction             func() float64
 		RateLimiterRefreshInterval    time.Duration
 		FairnessKeyRateLimitCacheSize func() int
 		MaxFairnessKeyWeightOverrides func() int
@@ -227,6 +233,7 @@ type (
 		PollerScalingDecisionsPerSecond func() float64
 
 		FairnessCounter               func() counter.CounterParams
+		FairnessPassDither            func() bool
 		PartitionScaleAllowedDrift    func() dynamicconfig.PartitionScaleAllowedDrift
 		PartitionScaleManagerSettings func() dynamicconfig.PartitionScaleManagerSettings
 
@@ -292,6 +299,7 @@ func NewConfig(
 		AutoEnableV2Sub:                          dynamicconfig.MatchingAutoEnableV2.Subscribe(dc),
 		GetTasksBatchSize:                        dynamicconfig.MatchingGetTasksBatchSize.Get(dc),
 		GetTasksReloadAt:                         dynamicconfig.MatchingGetTasksReloadAt.Get(dc),
+		ForceReadTasksOnWrite:                    dynamicconfig.MatchingForceReadTasksOnWrite.Get(dc),
 		UpdateAckInterval:                        dynamicconfig.MatchingUpdateAckInterval.Get(dc),
 		MetadataUpdateOnAppendInterval:           dynamicconfig.MatchingMetadataUpdateOnAppendInterval.Get(dc),
 		MaxTaskQueueIdleTime:                     dynamicconfig.MatchingMaxTaskQueueIdleTime.Get(dc),
@@ -377,10 +385,13 @@ func NewConfig(
 		PollerScalingDecisionsPerSecond: dynamicconfig.MatchingPollerScalingDecisionsPerSecond.Get(dc),
 
 		FairnessCounter:               dynamicconfig.MatchingFairnessCounter.Get(dc),
+		FairnessPassDither:            dynamicconfig.MatchingFairnessPassDither.Get(dc),
 		PartitionScaleAllowedDrift:    dynamicconfig.MatchingPartitionScaleAllowedDrift.Get(dc),
 		PartitionScaleManagerSettings: dynamicconfig.MatchingPartitionScaleManager.Get(dc),
 
 		LogAllReqErrors: dynamicconfig.LogAllReqErrors.Get(dc),
+
+		RateLimitFractionProvider: defaultTaskQueueRateLimitFractionProvider,
 	}
 }
 
@@ -414,6 +425,9 @@ func newTaskQueueConfig(tq *tqid.TaskQueue, config *Config, ns namespace.Name) *
 		},
 		GetTasksReloadAt: func() int {
 			return config.GetTasksReloadAt(ns.String(), taskQueueName, taskType)
+		},
+		ForceReadTasksOnWrite: func() bool {
+			return config.ForceReadTasksOnWrite(ns.String(), taskQueueName, taskType)
 		},
 		UpdateAckInterval: func() time.Duration {
 			return config.UpdateAckInterval(ns.String(), taskQueueName, taskType)
@@ -526,6 +540,9 @@ func newTaskQueueConfig(tq *tqid.TaskQueue, config *Config, ns namespace.Name) *
 		TaskQueueInfoByBuildIdTTL: func() time.Duration {
 			return config.TaskQueueInfoByBuildIdTTL(ns.String(), taskQueueName, taskType)
 		},
+		RateLimitFraction: func() float64 {
+			return config.RateLimitFractionProvider.GetRateLimitFraction(ns, taskQueueName, taskType)
+		},
 		RateLimiterRefreshInterval: config.RateLimiterRefreshInterval,
 		FairnessKeyRateLimitCacheSize: func() int {
 			return config.FairnessKeyRateLimitCacheSize(ns.String(), taskQueueName, taskType)
@@ -547,6 +564,9 @@ func newTaskQueueConfig(tq *tqid.TaskQueue, config *Config, ns namespace.Name) *
 		},
 		FairnessCounter: func() counter.CounterParams {
 			return config.FairnessCounter(ns.String(), taskQueueName, taskType)
+		},
+		FairnessPassDither: func() bool {
+			return config.FairnessPassDither(ns.String(), taskQueueName, taskType)
 		},
 		PartitionScaleAllowedDrift: func() dynamicconfig.PartitionScaleAllowedDrift {
 			return config.PartitionScaleAllowedDrift(ns.String(), taskQueueName, taskType)

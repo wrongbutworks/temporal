@@ -99,11 +99,11 @@ func (sm *scaleManager) Stop() {
 	sm.background.Cancel()
 	sm.partitionScaler.Stop()
 	if sm.emitGaugeMetrics() {
-		// this is unfortunate but at least allows max() across pods to get the right value
-		metricsHandler := sm.metricsHandler.WithTags(metrics.ScalerShadowModeTag(sm.settings().ShadowModeLogInterval > 0))
-		metrics.PartitionScaleRead.With(metricsHandler).Record(float64(-1))
-		metrics.PartitionScaleWrite.With(metricsHandler).Record(float64(-1))
-		metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(-1))
+		// Record -1 (a value real counts never take) so max() across pods settles
+		// to the live owner's value once this pod stops emitting.
+		metrics.PartitionScaleRead.With(sm.metricsHandler).Record(float64(-1))
+		metrics.PartitionScaleWrite.With(sm.metricsHandler).Record(float64(-1))
+		metrics.PartitionScaleTarget.With(sm.metricsHandler).Record(float64(-1))
 	}
 }
 
@@ -187,6 +187,18 @@ func (sm *scaleManager) callScaler() {
 		sm.releaseManagedState(settings)
 	}
 
+	// In shadow mode the manager applies nothing, so there are no managed
+	// read/write counts: record the -1 sentinel for both. Together with the target
+	// gauge (recorded below on a changed decision) this encodes shadow mode on the
+	// untagged series for consumers — read == write == -1 && target >= 0 means the
+	// target is a shadow hypothetical — and prevents a stale real read/write from
+	// lingering after shadow mode is enabled. Emitted on every active call (not
+	// just changed decisions) so the marker can't lag a scale event.
+	if shadowMode && sm.emitGaugeMetrics() {
+		metrics.PartitionScaleRead.With(sm.metricsHandler).Record(float64(-1))
+		metrics.PartitionScaleWrite.With(sm.metricsHandler).Record(float64(-1))
+	}
+
 	// grab current batch (may be zero)
 	tasks := int(sm.batch.Swap(0))
 
@@ -224,7 +236,9 @@ func (sm *scaleManager) callScaler() {
 
 	if shadowMode {
 		if sm.emitGaugeMetrics() {
-			metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(target))
+			// Untagged: read == write == -1 (recorded above) marks this as a shadow
+			// hypothetical rather than an applied target.
+			metrics.PartitionScaleTarget.With(sm.metricsHandler).Record(float64(target))
 		}
 		if sm.timeSource.Now().Before(sm.nextShadowLog) || // too early
 			sm.prevShadowTarget == target || // only log new changes
@@ -299,11 +313,14 @@ func (sm *scaleManager) setState(newState *persistencespb.PartitionScaleState, s
 		sm.userDataManager.SetPartitionScale(newInfo)
 	}
 
-	if sm.emitGaugeMetrics() {
-		metricsHandler := sm.metricsHandler.WithTags(metrics.ScalerShadowModeTag(settings.ShadowModeLogInterval > 0))
-		metrics.PartitionScaleRead.With(metricsHandler).Record(float64(newInfo.Read))
-		metrics.PartitionScaleWrite.With(metricsHandler).Record(float64(newInfo.Write))
-		metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(sm.scaleState.GetTarget()))
+	// Only emit the real read/write/target here in non-shadow mode. In shadow mode
+	// callScaler records the -1 sentinel for read/write and the hypothetical target,
+	// so emitting real counts here (e.g. from the release-to-baseline setState on
+	// entering shadow) would contradict that encoding.
+	if sm.emitGaugeMetrics() && settings.ShadowModeLogInterval <= 0 {
+		metrics.PartitionScaleRead.With(sm.metricsHandler).Record(float64(newInfo.Read))
+		metrics.PartitionScaleWrite.With(sm.metricsHandler).Record(float64(newInfo.Write))
+		metrics.PartitionScaleTarget.With(sm.metricsHandler).Record(float64(sm.scaleState.GetTarget()))
 	}
 }
 

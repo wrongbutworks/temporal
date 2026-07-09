@@ -223,7 +223,9 @@ func (sm *scaleManager) callScaler() {
 	}
 
 	if shadowMode {
-		metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(target))
+		if sm.emitGaugeMetrics() {
+			metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(target))
+		}
 		if sm.timeSource.Now().Before(sm.nextShadowLog) || // too early
 			sm.prevShadowTarget == target || // only log new changes
 			target <= 0 { // only log if scaler is enabled

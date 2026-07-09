@@ -303,7 +303,7 @@ func (sm *scaleManager) setState(newState *persistencespb.PartitionScaleState, s
 		metricsHandler := sm.metricsHandler.WithTags(metrics.ScalerShadowModeTag(settings.ShadowModeLogInterval > 0))
 		metrics.PartitionScaleRead.With(metricsHandler).Record(float64(newInfo.Read))
 		metrics.PartitionScaleWrite.With(metricsHandler).Record(float64(newInfo.Write))
-		metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(sm.scaleState.Target))
+		metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(sm.scaleState.GetTarget()))
 	}
 }
 

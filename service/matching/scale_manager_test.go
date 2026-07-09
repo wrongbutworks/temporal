@@ -18,6 +18,7 @@ import (
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/metrics"
+	"go.temporal.io/server/common/metrics/metricstest"
 	"go.temporal.io/server/common/testing/await"
 	"go.temporal.io/server/common/testing/protorequire"
 	"go.temporal.io/server/common/testing/protoutils"
@@ -41,6 +42,12 @@ type ScaleManagerSuite struct {
 	sm       *scaleManager
 	settings dynamicconfig.PartitionScaleManagerSettings
 
+	// metricsHandler and emitGaugeMetrics back the handler and dynamic-config flag
+	// passed to the manager. They default to a noop handler with gauges disabled;
+	// tests that assert on gauges override them before calling startManager.
+	metricsHandler   metrics.Handler
+	emitGaugeMetrics bool
+
 	// newTarget counts "new target" logs, which are also used for test synchronization
 	newTarget *testlogger.Expectation
 }
@@ -61,6 +68,9 @@ func (s *ScaleManagerSuite) SetupTest() {
 	// scaler.Stop is called from sm.Stop in TearDownTest, but only if the test
 	// actually started the manager.
 	s.scaler.EXPECT().Stop().AnyTimes()
+
+	s.metricsHandler = metrics.NoopMetricsHandler
+	s.emitGaugeMetrics = false
 
 	s.settings = dynamicconfig.PartitionScaleManagerSettings{
 		MaxRate:            10,  // 100ms cooldown
@@ -100,14 +110,14 @@ func (s *ScaleManagerSuite) startManagerWithLogger(
 		context.Background(),
 		tqid.MustNormalPartitionFromRpcName("tq", "ns-id", enumspb.TASK_QUEUE_TYPE_WORKFLOW),
 		logger,
-		metrics.NoopMetricsHandler,
+		s.metricsHandler,
 		s.userData,
 		s.matching,
 		s.scaler,
 		s.timeSource,
 		dynamicconfig.GetTypedPropertyFn(s.settings),
 		dynamicconfig.GetIntPropertyFn(writePartitions),
-		dynamicconfig.GetBoolPropertyFn(false),
+		dynamicconfig.GetBoolPropertyFn(s.emitGaugeMetrics),
 	)
 	s.sm.Start(initial, s.scaleDB)
 }
@@ -1083,6 +1093,165 @@ func (s *ScaleManagerSuite) TestScaleStateToInfoShrinkLimit() {
 	info := scaleStateToInfo(nil, s.settings)
 	s.Equal(int32(0), info.Read)
 	s.Equal(int32(0), info.Write)
+}
+
+// --- gauge metric tests ---
+
+// newCaptureHandler installs a capturing metrics handler with gauge emission
+// enabled and returns it. Call before startManager, then StartCapture after
+// startManager so that gauges recorded during Start (which runs setState
+// synchronously) are excluded from the assertion window.
+func (s *ScaleManagerSuite) newCaptureHandler() *metricstest.CaptureHandler {
+	capture := metricstest.NewCaptureHandler()
+	s.metricsHandler = capture
+	s.emitGaugeMetrics = true
+	return capture
+}
+
+// awaitGauge blocks until at least n recordings of the named metric exist and
+// returns them (a snapshot of the values recorded so far).
+func (s *ScaleManagerSuite) awaitGauge(cap *metricstest.Capture, name string, n int) []*metricstest.CapturedRecording {
+	s.T().Helper()
+	var recs []*metricstest.CapturedRecording
+	await.RequireTruef(s.T(), func() bool {
+		recs = cap.Snapshot()[name]
+		return len(recs) >= n
+	}, time.Second, time.Millisecond, "metric %q not recorded %d time(s)", name, n)
+	return recs
+}
+
+func gaugeValues(recs []*metricstest.CapturedRecording) []float64 {
+	out := make([]float64, len(recs))
+	for i, r := range recs {
+		out[i] = r.Value.(float64)
+	}
+	return out
+}
+
+// TestApplyEmitsAllGauges verifies that a real (non-shadow) apply records
+// partition_scale_{read,write,target} with the applied values, tagged
+// scaler_shadow_mode=false. On initial scale-up from 0 with 4 write partitions
+// and a target of 2: read covers all 4 config partitions, write floors at the
+// target (2), and target is the applied target (2).
+func (s *ScaleManagerSuite) TestApplyEmitsAllGauges() {
+	capture := s.newCaptureHandler()
+
+	s.scaler.EXPECT().OnTasks(gomock.Any()).
+		Return(PartitionScalerDecision{NewTarget: 2})
+	s.scaleDB.EXPECT().UpdateScaleState(gomock.Any(), gomock.Any()).Return(nil)
+	s.userData.EXPECT().SetPartitionScale(gomock.Any()).AnyTimes()
+
+	// Start with a non-nil baseline so Start's setState is harmless; start the
+	// capture afterward so only the apply's recordings are observed.
+	s.startManager(4, &persistencespb.PartitionScaleState{})
+	cap := capture.StartCapture()
+	defer capture.StopCapture(cap)
+
+	s.sm.AddedTasks(1)
+
+	// target is recorded last in setState, so once it's present read/write are too.
+	target := s.awaitGauge(cap, "partition_scale_target", 1)
+	snap := cap.Snapshot()
+	s.Equal([]float64{2}, gaugeValues(target), "target gauge")
+	s.Equal([]float64{4}, gaugeValues(snap["partition_scale_read"]), "read gauge")
+	s.Equal([]float64{2}, gaugeValues(snap["partition_scale_write"]), "write gauge")
+
+	// all three carry scaler_shadow_mode=false in the non-shadow path.
+	for _, name := range []string{"partition_scale_read", "partition_scale_write", "partition_scale_target"} {
+		s.Equal("false", snap[name][0].Tags[metrics.ScalerShadowModeTagName], "%s shadow tag", name)
+	}
+}
+
+// TestShadowModeEmitsTargetGaugeEachEvent verifies that in shadow mode the
+// hypothetical target is recorded as partition_scale_target (tagged
+// scaler_shadow_mode=true) on every decision that changes the target, even
+// though nothing is persisted. read/write are not recorded, since setState is
+// never called on the shadow decision path.
+func (s *ScaleManagerSuite) TestShadowModeEmitsTargetGaugeEachEvent() {
+	s.settings.ShadowModeLogInterval = time.Minute
+	capture := s.newCaptureHandler()
+
+	inputs := make(chan PartitionScalerInput, 2)
+	gomock.InOrder(
+		s.scaler.EXPECT().OnTasks(gomock.Any()).
+			Do(func(in PartitionScalerInput) { inputs <- in }).
+			Return(PartitionScalerDecision{NewTarget: 2}),
+		s.scaler.EXPECT().OnTasks(gomock.Any()).
+			Do(func(in PartitionScalerInput) { inputs <- in }).
+			Return(PartitionScalerDecision{NewTarget: 3}),
+	)
+
+	// Start at baseline (Target 0) so entering shadow mode triggers no release,
+	// keeping the only recordings the shadow decision gauges.
+	s.startManager(4, &persistencespb.PartitionScaleState{})
+	cap := capture.StartCapture()
+	defer capture.StopCapture(cap)
+
+	s.sm.AddedTasks(1)
+	waitRecv(s, inputs, "first shadow call missing")
+	s.awaitDecisionApplied(1)                    // barrier: nextDecision set before we advance
+	s.timeSource.Advance(110 * time.Millisecond) // past the 100ms cooldown
+	s.sm.AddedTasks(1)
+	waitRecv(s, inputs, "second shadow call missing")
+
+	target := s.awaitGauge(cap, "partition_scale_target", 2)
+	s.Equal([]float64{2, 3}, gaugeValues(target), "target gauge per changed decision")
+	for _, r := range target {
+		s.Equal("true", r.Tags[metrics.ScalerShadowModeTagName], "shadow tag")
+	}
+
+	// shadow mode never applies state, so read/write gauges are not emitted.
+	snap := cap.Snapshot()
+	s.Empty(snap["partition_scale_read"], "read gauge must not be emitted in shadow mode")
+	s.Empty(snap["partition_scale_write"], "write gauge must not be emitted in shadow mode")
+}
+
+// TestStopClearsAllGauges verifies that Stop records -1 for
+// partition_scale_{read,write,target} so that a max() across pods settles to
+// the value of the pods that are still up.
+func (s *ScaleManagerSuite) TestStopClearsAllGauges() {
+	capture := s.newCaptureHandler()
+
+	s.scaler.EXPECT().OnTasks(gomock.Any()).
+		Return(PartitionScalerDecision{NoChange: true}).AnyTimes()
+	s.userData.EXPECT().SetPartitionScale(gomock.Any()).AnyTimes()
+
+	s.startManager(4, &persistencespb.PartitionScaleState{})
+	cap := capture.StartCapture()
+	defer capture.StopCapture(cap)
+
+	s.sm.Stop()
+	<-s.sm.background.Done()
+	s.sm = nil // TearDownTest must not Stop again
+
+	snap := cap.Snapshot()
+	s.Equal([]float64{-1}, gaugeValues(snap["partition_scale_read"]), "read gauge on stop")
+	s.Equal([]float64{-1}, gaugeValues(snap["partition_scale_write"]), "write gauge on stop")
+	s.Equal([]float64{-1}, gaugeValues(snap["partition_scale_target"]), "target gauge on stop")
+}
+
+// TestStartWithNilStateEmitsGaugesWithoutPanic is a regression test for the
+// target gauge path: setState must read the target with GetTarget() so that a
+// task queue starting with no persisted scale state (nil) does not panic when
+// gauges are enabled. read/write/target all record 0 for the empty baseline.
+func (s *ScaleManagerSuite) TestStartWithNilStateEmitsGaugesWithoutPanic() {
+	capture := s.newCaptureHandler()
+
+	s.scaler.EXPECT().OnTasks(gomock.Any()).
+		Return(PartitionScalerDecision{NoChange: true}).AnyTimes()
+	s.userData.EXPECT().SetPartitionScale(gomock.Any()).AnyTimes()
+
+	cap := capture.StartCapture()
+	defer capture.StopCapture(cap)
+
+	// Start(nil): setState runs synchronously and must not panic on nil state.
+	s.startManager(4, nil)
+
+	target := s.awaitGauge(cap, "partition_scale_target", 1)
+	snap := cap.Snapshot()
+	s.Equal([]float64{0}, gaugeValues(target), "target gauge for empty baseline")
+	s.Equal([]float64{0}, gaugeValues(snap["partition_scale_read"]), "read gauge")
+	s.Equal([]float64{0}, gaugeValues(snap["partition_scale_write"]), "write gauge")
 }
 
 // TestDBWriteFailureKeepsState verifies that when persistence fails the

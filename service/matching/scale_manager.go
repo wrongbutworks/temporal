@@ -100,8 +100,10 @@ func (sm *scaleManager) Stop() {
 	sm.partitionScaler.Stop()
 	if sm.emitGaugeMetrics() {
 		// this is unfortunate but at least allows max() across pods to get the right value
-		metrics.PartitionScaleRead.With(sm.metricsHandler).Record(float64(-1))
-		metrics.PartitionScaleWrite.With(sm.metricsHandler).Record(float64(-1))
+		metricsHandler := sm.metricsHandler.WithTags(metrics.ScalerShadowModeTag(sm.settings().ShadowModeLogInterval > 0))
+		metrics.PartitionScaleRead.With(metricsHandler).Record(float64(-1))
+		metrics.PartitionScaleWrite.With(metricsHandler).Record(float64(-1))
+		metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(-1))
 	}
 }
 
@@ -172,6 +174,7 @@ func (sm *scaleManager) callScaler() {
 
 	settings := sm.settings()
 	shadowMode := settings.ShadowModeLogInterval > 0
+	metricsHandler := sm.metricsHandler.WithTags(metrics.ScalerShadowModeTag(shadowMode))
 
 	// Entering shadow mode on top of a previously-applied managed target releases
 	// control back to the dynamic-config baseline: zero the managed target once so
@@ -220,12 +223,12 @@ func (sm *scaleManager) callScaler() {
 	}
 
 	if shadowMode {
+		metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(target))
 		if sm.timeSource.Now().Before(sm.nextShadowLog) || // too early
 			sm.prevShadowTarget == target || // only log new changes
 			target <= 0 { // only log if scaler is enabled
 			// emit scale event metric as a heartbeat even if no shadow log
-			metrics.PartitionScaleEvents.With(sm.metricsHandler.
-				WithTags(metrics.ScalerShadowModeTag(shadowMode))).Record(1)
+			metrics.PartitionScaleEvents.With(metricsHandler).Record(1)
 			return
 		}
 		sm.nextShadowLog = sm.timeSource.Now().Add(settings.ShadowModeLogInterval)
@@ -237,7 +240,7 @@ func (sm *scaleManager) callScaler() {
 			return
 		}
 
-		sm.setState(newState, settings)
+		sm.setState(newState, settings) // emits partition_scale_{read,write,target}
 	}
 
 	cooldown := time.Duration(float32(time.Second) / settings.MaxRate)
@@ -248,8 +251,7 @@ func (sm *scaleManager) callScaler() {
 		tag.Int32("prev-target", prevTarget),
 		tag.Int32("max-target", newState.MaxTarget),
 		tag.Bool(metrics.ScalerShadowModeTagName, shadowMode))
-	metrics.PartitionScaleEvents.With(sm.metricsHandler.
-		WithTags(metrics.ScalerShadowModeTag(shadowMode))).Record(1)
+	metrics.PartitionScaleEvents.With(metricsHandler).Record(1)
 }
 
 // releaseManagedState relinquishes a previously-applied managed scale target back
@@ -296,8 +298,10 @@ func (sm *scaleManager) setState(newState *persistencespb.PartitionScaleState, s
 	}
 
 	if sm.emitGaugeMetrics() {
-		metrics.PartitionScaleRead.With(sm.metricsHandler).Record(float64(newInfo.Read))
-		metrics.PartitionScaleWrite.With(sm.metricsHandler).Record(float64(newInfo.Write))
+		metricsHandler := sm.metricsHandler.WithTags(metrics.ScalerShadowModeTag(settings.ShadowModeLogInterval > 0))
+		metrics.PartitionScaleRead.With(metricsHandler).Record(float64(newInfo.Read))
+		metrics.PartitionScaleWrite.With(metricsHandler).Record(float64(newInfo.Write))
+		metrics.PartitionScaleTarget.With(metricsHandler).Record(float64(sm.scaleState.Target))
 	}
 }
 

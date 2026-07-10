@@ -1129,10 +1129,10 @@ func gaugeValues(recs []*metricstest.CapturedRecording) []float64 {
 }
 
 // TestApplyEmitsAllGauges verifies that a real (non-shadow) apply records
-// partition_scale_{read,write,target} with the applied values and no
-// scaler_shadow_mode tag. On initial scale-up from 0 with 4 write partitions and
-// a target of 2: read covers all 4 config partitions, write floors at the target
-// (2), and target is the applied target (2).
+// partition_scale_{read,write,target} with the applied values.
+// On initial scale-up from 0 with 4 write partitions and a target of 2: read
+// covers all 4 config partitions, write floors at the target (2), and target
+// is the applied target (2).
 func (s *ScaleManagerSuite) TestApplyEmitsAllGauges() {
 	capture := s.newCaptureHandler()
 
@@ -1144,14 +1144,14 @@ func (s *ScaleManagerSuite) TestApplyEmitsAllGauges() {
 	// Start with a non-nil baseline so Start's setState is harmless; start the
 	// capture afterward so only the apply's recordings are observed.
 	s.startManager(4, &persistencespb.PartitionScaleState{})
-	cap := capture.StartCapture()
-	defer capture.StopCapture(cap)
+	capt := capture.StartCapture()
+	defer capture.StopCapture(capt)
 
 	s.sm.AddedTasks(1)
 
 	// target is recorded last in setState, so once it's present read/write are too.
-	target := s.awaitGauge(cap, "partition_scale_target", 1)
-	snap := cap.Snapshot()
+	target := s.awaitGauge(capt, "partition_scale_target", 1)
+	snap := capt.Snapshot()
 	s.Equal([]float64{2}, gaugeValues(target), "target gauge")
 	s.Equal([]float64{4}, gaugeValues(snap["partition_scale_read"]), "read gauge")
 	s.Equal([]float64{2}, gaugeValues(snap["partition_scale_write"]), "write gauge")
@@ -1183,8 +1183,8 @@ func (s *ScaleManagerSuite) TestShadowModeEmitsSentinelOnReleaseAndTarget() {
 	// Start with a leftover managed target so entering shadow mode triggers the
 	// one-time release that records the sentinel.
 	s.startManager(4, &persistencespb.PartitionScaleState{Target: 5})
-	cap := capture.StartCapture()
-	defer capture.StopCapture(cap)
+	capt := capture.StartCapture()
+	defer capture.StopCapture(capt)
 
 	s.sm.AddedTasks(1)
 	waitRecv(s, inputs, "first shadow call missing")
@@ -1194,11 +1194,11 @@ func (s *ScaleManagerSuite) TestShadowModeEmitsSentinelOnReleaseAndTarget() {
 	waitRecv(s, inputs, "second shadow call missing")
 
 	// Two active shadow calls, each recording the hypothetical target...
-	target := s.awaitGauge(cap, "partition_scale_target", 2)
+	target := s.awaitGauge(capt, "partition_scale_target", 2)
 	s.Equal([]float64{2, 3}, gaugeValues(target), "target gauge per changed decision")
 
 	// ...but the read/write sentinel is recorded only once, on the release.
-	snap := cap.Snapshot()
+	snap := capt.Snapshot()
 	s.Equal([]float64{-1}, gaugeValues(snap["partition_scale_read"]), "read sentinel once on release")
 	s.Equal([]float64{-1}, gaugeValues(snap["partition_scale_write"]), "write sentinel once on release")
 }
@@ -1224,8 +1224,8 @@ func (s *ScaleManagerSuite) TestShadowModeBaselineEntryEmitsNoSentinel() {
 
 	// Start at baseline (Target 0) so entering shadow mode triggers no release.
 	s.startManager(4, &persistencespb.PartitionScaleState{})
-	cap := capture.StartCapture()
-	defer capture.StopCapture(cap)
+	capt := capture.StartCapture()
+	defer capture.StopCapture(capt)
 
 	s.sm.AddedTasks(1)
 	waitRecv(s, inputs, "first shadow call missing")
@@ -1235,10 +1235,10 @@ func (s *ScaleManagerSuite) TestShadowModeBaselineEntryEmitsNoSentinel() {
 	waitRecv(s, inputs, "second shadow call missing")
 
 	// Target hypotheticals are recorded, but no sentinel is ever written.
-	target := s.awaitGauge(cap, "partition_scale_target", 2)
+	target := s.awaitGauge(capt, "partition_scale_target", 2)
 	s.Equal([]float64{2, 3}, gaugeValues(target), "target gauge per changed decision")
 
-	snap := cap.Snapshot()
+	snap := capt.Snapshot()
 	s.Empty(gaugeValues(snap["partition_scale_read"]), "no read sentinel at baseline entry")
 	s.Empty(gaugeValues(snap["partition_scale_write"]), "no write sentinel at baseline entry")
 }
@@ -1254,14 +1254,14 @@ func (s *ScaleManagerSuite) TestStopClearsAllGauges() {
 	s.userData.EXPECT().SetPartitionScale(gomock.Any()).AnyTimes()
 
 	s.startManager(4, &persistencespb.PartitionScaleState{})
-	cap := capture.StartCapture()
-	defer capture.StopCapture(cap)
+	capt := capture.StartCapture()
+	defer capture.StopCapture(capt)
 
 	s.sm.Stop()
 	<-s.sm.background.Done()
 	s.sm = nil // TearDownTest must not Stop again
 
-	snap := cap.Snapshot()
+	snap := capt.Snapshot()
 	for _, name := range []string{"partition_scale_read", "partition_scale_write", "partition_scale_target"} {
 		s.Equal([]float64{-1}, gaugeValues(snap[name]), "%s on stop", name)
 	}
@@ -1278,14 +1278,14 @@ func (s *ScaleManagerSuite) TestStartWithNilStateEmitsGaugesWithoutPanic() {
 		Return(PartitionScalerDecision{NoChange: true}).AnyTimes()
 	s.userData.EXPECT().SetPartitionScale(gomock.Any()).AnyTimes()
 
-	cap := capture.StartCapture()
-	defer capture.StopCapture(cap)
+	capt := capture.StartCapture()
+	defer capture.StopCapture(capt)
 
 	// Start(nil): setState runs synchronously and must not panic on nil state.
 	s.startManager(4, nil)
 
-	target := s.awaitGauge(cap, "partition_scale_target", 1)
-	snap := cap.Snapshot()
+	target := s.awaitGauge(capt, "partition_scale_target", 1)
+	snap := capt.Snapshot()
 	s.Equal([]float64{0}, gaugeValues(target), "target gauge for empty baseline")
 	s.Equal([]float64{0}, gaugeValues(snap["partition_scale_read"]), "read gauge")
 	s.Equal([]float64{0}, gaugeValues(snap["partition_scale_write"]), "write gauge")

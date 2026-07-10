@@ -174,7 +174,7 @@ func (sm *scaleManager) callScaler() {
 
 	settings := sm.settings()
 	shadowMode := settings.ShadowModeLogInterval > 0
-	metricsHandler := sm.metricsHandler.WithTags(metrics.ScalerShadowModeTag(shadowMode))
+	metricsHandlerWithShadowTag := sm.metricsHandler.WithTags(metrics.ScalerShadowModeTag(shadowMode))
 
 	// Entering shadow mode on top of a previously-applied managed target releases
 	// control back to the dynamic-config baseline: zero the managed target once so
@@ -185,18 +185,17 @@ func (sm *scaleManager) callScaler() {
 	// applies the scaler's hypothetical decisions.
 	if shadowMode && sm.scaleState.GetTarget() != 0 {
 		sm.releaseManagedState(settings)
-	}
-
-	// In shadow mode the manager applies nothing, so there are no managed
-	// read/write counts: record the -1 sentinel for both. Together with the target
-	// gauge (recorded below on a changed decision) this encodes shadow mode on the
-	// untagged series for consumers — read == write == -1 && target >= 0 means the
-	// target is a shadow hypothetical — and prevents a stale real read/write from
-	// lingering after shadow mode is enabled. Emitted on every active call (not
-	// just changed decisions) so the marker can't lag a scale event.
-	if shadowMode && sm.emitGaugeMetrics() {
-		metrics.PartitionScaleRead.With(sm.metricsHandler).Record(float64(-1))
-		metrics.PartitionScaleWrite.With(sm.metricsHandler).Record(float64(-1))
+		// In shadow mode the manager applies nothing, so there are no managed
+		// read/write counts: record the -1 sentinel for both to release.
+		//
+		// read == write == -1 (or absent) && target >= 0 means the target is a shadow
+		// target and not applied. There is a short window where read could be > -1
+		// while target is in shadow mode, if scaling switched from enabled to shadow
+		// after the scale target became zero.
+		if sm.emitGaugeMetrics() {
+			metrics.PartitionScaleRead.With(sm.metricsHandler).Record(float64(-1))
+			metrics.PartitionScaleWrite.With(sm.metricsHandler).Record(float64(-1))
+		}
 	}
 
 	// grab current batch (may be zero)
@@ -236,15 +235,15 @@ func (sm *scaleManager) callScaler() {
 
 	if shadowMode {
 		if sm.emitGaugeMetrics() {
-			// Untagged: read == write == -1 (recorded above) marks this as a shadow
-			// hypothetical rather than an applied target.
+			// Untagged: read == write == -1 (recorded above on release) marks this as a
+			// shadow target rather than an applied one; see the sentinel encoding above.
 			metrics.PartitionScaleTarget.With(sm.metricsHandler).Record(float64(target))
 		}
 		if sm.timeSource.Now().Before(sm.nextShadowLog) || // too early
 			sm.prevShadowTarget == target || // only log new changes
 			target <= 0 { // only log if scaler is enabled
 			// emit scale event metric as a heartbeat even if no shadow log
-			metrics.PartitionScaleEvents.With(metricsHandler).Record(1)
+			metrics.PartitionScaleEvents.With(metricsHandlerWithShadowTag).Record(1)
 			return
 		}
 		sm.nextShadowLog = sm.timeSource.Now().Add(settings.ShadowModeLogInterval)
@@ -267,7 +266,7 @@ func (sm *scaleManager) callScaler() {
 		tag.Int32("prev-target", prevTarget),
 		tag.Int32("max-target", newState.MaxTarget),
 		tag.Bool(metrics.ScalerShadowModeTagName, shadowMode))
-	metrics.PartitionScaleEvents.With(metricsHandler).Record(1)
+	metrics.PartitionScaleEvents.With(metricsHandlerWithShadowTag).Record(1)
 }
 
 // releaseManagedState relinquishes a previously-applied managed scale target back
@@ -314,9 +313,10 @@ func (sm *scaleManager) setState(newState *persistencespb.PartitionScaleState, s
 	}
 
 	// Only emit the real read/write/target here in non-shadow mode. In shadow mode
-	// callScaler records the -1 sentinel for read/write and the hypothetical target,
-	// so emitting real counts here (e.g. from the release-to-baseline setState on
-	// entering shadow) would contradict that encoding.
+	// callScaler owns these gauges: it records the hypothetical target, and records
+	// the -1 sentinel for read/write once when releasing a leftover managed target on
+	// entering shadow. Emitting real counts here (e.g. from that release-to-baseline
+	// setState) would contradict that encoding, so we skip it in shadow mode.
 	if sm.emitGaugeMetrics() && settings.ShadowModeLogInterval <= 0 {
 		metrics.PartitionScaleRead.With(sm.metricsHandler).Record(float64(newInfo.Read))
 		metrics.PartitionScaleWrite.With(sm.metricsHandler).Record(float64(newInfo.Write))

@@ -1128,6 +1128,51 @@ func gaugeValues(recs []*metricstest.CapturedRecording) []float64 {
 	return out
 }
 
+// driveTwoShadowDecisions starts the manager in shadow mode with the given
+// initial state and drives two active shadow decisions (hypothetical targets 2
+// then 3). It asserts the shared expectation — partition_scale_target records
+// both hypotheticals even though nothing is persisted — and returns the capture
+// so callers can assert on the read/write sentinel. expectRelease controls
+// whether the one-time release-to-baseline DB write (recorded when entering
+// shadow on top of a leftover managed target) is expected.
+func (s *ScaleManagerSuite) driveTwoShadowDecisions(
+	capture *metricstest.CaptureHandler,
+	initial *persistencespb.PartitionScaleState,
+	expectRelease bool,
+) *metricstest.Capture {
+	s.T().Helper()
+	s.settings.ShadowModeLogInterval = time.Minute
+
+	inputs := make(chan PartitionScalerInput, 2)
+	gomock.InOrder(
+		s.scaler.EXPECT().OnTasks(gomock.Any()).
+			Do(func(in PartitionScalerInput) { inputs <- in }).
+			Return(PartitionScalerDecision{NewTarget: 2}),
+		s.scaler.EXPECT().OnTasks(gomock.Any()).
+			Do(func(in PartitionScalerInput) { inputs <- in }).
+			Return(PartitionScalerDecision{NewTarget: 3}),
+	)
+	if expectRelease {
+		s.scaleDB.EXPECT().UpdateScaleState(gomock.Any(), gomock.Any()).Return(nil).Times(1)
+	}
+	s.userData.EXPECT().SetPartitionScale(gomock.Any()).AnyTimes()
+
+	s.startManager(4, initial)
+	capt := capture.StartCapture()
+
+	s.sm.AddedTasks(1)
+	waitRecv(s, inputs, "first shadow call missing")
+	s.awaitDecisionApplied(1)                    // barrier: nextDecision set before we advance
+	s.timeSource.Advance(110 * time.Millisecond) // past the 100ms cooldown
+	s.sm.AddedTasks(1)
+	waitRecv(s, inputs, "second shadow call missing")
+
+	// Two active shadow calls, each recording the hypothetical target.
+	target := s.awaitGauge(capt, "partition_scale_target", 2)
+	s.Equal([]float64{2, 3}, gaugeValues(target), "target gauge per changed decision")
+	return capt
+}
+
 // TestApplyEmitsAllGauges verifies that a real (non-shadow) apply records
 // partition_scale_{read,write,target} with the applied values.
 // On initial scale-up from 0 with 4 write partitions and a target of 2: read
@@ -1164,40 +1209,15 @@ func (s *ScaleManagerSuite) TestApplyEmitsAllGauges() {
 // hypothetical target is recorded on partition_scale_target on every decision that
 // changes it, even though nothing is persisted.
 func (s *ScaleManagerSuite) TestShadowModeEmitsSentinelOnReleaseAndTarget() {
-	s.settings.ShadowModeLogInterval = time.Minute
 	capture := s.newCaptureHandler()
 
-	inputs := make(chan PartitionScalerInput, 2)
-	gomock.InOrder(
-		s.scaler.EXPECT().OnTasks(gomock.Any()).
-			Do(func(in PartitionScalerInput) { inputs <- in }).
-			Return(PartitionScalerDecision{NewTarget: 2}),
-		s.scaler.EXPECT().OnTasks(gomock.Any()).
-			Do(func(in PartitionScalerInput) { inputs <- in }).
-			Return(PartitionScalerDecision{NewTarget: 3}),
-	)
-	// The only persisted write is the release-to-baseline on the first call.
-	s.scaleDB.EXPECT().UpdateScaleState(gomock.Any(), gomock.Any()).Return(nil).Times(1)
-	s.userData.EXPECT().SetPartitionScale(gomock.Any()).AnyTimes()
-
 	// Start with a leftover managed target so entering shadow mode triggers the
-	// one-time release that records the sentinel.
-	s.startManager(4, &persistencespb.PartitionScaleState{Target: 5})
-	capt := capture.StartCapture()
+	// one-time release-to-baseline (the only persisted write) that records the
+	// sentinel.
+	capt := s.driveTwoShadowDecisions(capture, &persistencespb.PartitionScaleState{Target: 5}, true)
 	defer capture.StopCapture(capt)
 
-	s.sm.AddedTasks(1)
-	waitRecv(s, inputs, "first shadow call missing")
-	s.awaitDecisionApplied(1)                    // barrier: nextDecision set before we advance
-	s.timeSource.Advance(110 * time.Millisecond) // past the 100ms cooldown
-	s.sm.AddedTasks(1)
-	waitRecv(s, inputs, "second shadow call missing")
-
-	// Two active shadow calls, each recording the hypothetical target...
-	target := s.awaitGauge(capt, "partition_scale_target", 2)
-	s.Equal([]float64{2, 3}, gaugeValues(target), "target gauge per changed decision")
-
-	// ...but the read/write sentinel is recorded only once, on the release.
+	// The read/write sentinel is recorded only once, on the release.
 	snap := capt.Snapshot()
 	s.Equal([]float64{-1}, gaugeValues(snap["partition_scale_read"]), "read sentinel once on release")
 	s.Equal([]float64{-1}, gaugeValues(snap["partition_scale_write"]), "write sentinel once on release")
@@ -1208,36 +1228,14 @@ func (s *ScaleManagerSuite) TestShadowModeEmitsSentinelOnReleaseAndTarget() {
 // no read/write sentinel is recorded at all. The hypothetical target is still
 // recorded per changed decision. This is the expected shadow-first rollout path.
 func (s *ScaleManagerSuite) TestShadowModeBaselineEntryEmitsNoSentinel() {
-	s.settings.ShadowModeLogInterval = time.Minute
 	capture := s.newCaptureHandler()
 
-	inputs := make(chan PartitionScalerInput, 2)
-	gomock.InOrder(
-		s.scaler.EXPECT().OnTasks(gomock.Any()).
-			Do(func(in PartitionScalerInput) { inputs <- in }).
-			Return(PartitionScalerDecision{NewTarget: 2}),
-		s.scaler.EXPECT().OnTasks(gomock.Any()).
-			Do(func(in PartitionScalerInput) { inputs <- in }).
-			Return(PartitionScalerDecision{NewTarget: 3}),
-	)
-	s.userData.EXPECT().SetPartitionScale(gomock.Any()).AnyTimes()
-
-	// Start at baseline (Target 0) so entering shadow mode triggers no release.
-	s.startManager(4, &persistencespb.PartitionScaleState{})
-	capt := capture.StartCapture()
+	// Start at baseline (Target 0) so entering shadow mode triggers no release,
+	// hence no persisted write.
+	capt := s.driveTwoShadowDecisions(capture, &persistencespb.PartitionScaleState{}, false)
 	defer capture.StopCapture(capt)
 
-	s.sm.AddedTasks(1)
-	waitRecv(s, inputs, "first shadow call missing")
-	s.awaitDecisionApplied(1)                    // barrier: nextDecision set before we advance
-	s.timeSource.Advance(110 * time.Millisecond) // past the 100ms cooldown
-	s.sm.AddedTasks(1)
-	waitRecv(s, inputs, "second shadow call missing")
-
-	// Target hypotheticals are recorded, but no sentinel is ever written.
-	target := s.awaitGauge(capt, "partition_scale_target", 2)
-	s.Equal([]float64{2, 3}, gaugeValues(target), "target gauge per changed decision")
-
+	// No sentinel is ever written when there's nothing to release.
 	snap := capt.Snapshot()
 	s.Empty(gaugeValues(snap["partition_scale_read"]), "no read sentinel at baseline entry")
 	s.Empty(gaugeValues(snap["partition_scale_write"]), "no write sentinel at baseline entry")

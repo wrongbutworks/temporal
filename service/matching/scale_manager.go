@@ -99,8 +99,7 @@ func (sm *scaleManager) Stop() {
 	sm.background.Cancel()
 	sm.partitionScaler.Stop()
 	if sm.emitGaugeMetrics() {
-		// Record -1 (a value real counts never take) so max() across pods settles
-		// to the live owner's value once this pod stops emitting.
+		// this is unfortunate but at least allows max() across pods to get the right value
 		metrics.PartitionScaleRead.With(sm.metricsHandler).Record(float64(-1))
 		metrics.PartitionScaleWrite.With(sm.metricsHandler).Record(float64(-1))
 		metrics.PartitionScaleTarget.With(sm.metricsHandler).Record(float64(-1))

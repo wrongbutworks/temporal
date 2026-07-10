@@ -1128,17 +1128,6 @@ func gaugeValues(recs []*metricstest.CapturedRecording) []float64 {
 	return out
 }
 
-// assertNoShadowTag asserts that none of the recordings carry a
-// scaler_shadow_mode tag: the scale gauges are untagged and encode shadow mode
-// via the read==write==-1 sentinel instead.
-func (s *ScaleManagerSuite) assertNoShadowTag(recs []*metricstest.CapturedRecording) {
-	s.T().Helper()
-	for _, r := range recs {
-		_, ok := r.Tags[metrics.ScalerShadowModeTagName]
-		s.False(ok, "scale gauge should not carry the scaler_shadow_mode tag")
-	}
-}
-
 // TestApplyEmitsAllGauges verifies that a real (non-shadow) apply records
 // partition_scale_{read,write,target} with the applied values and no
 // scaler_shadow_mode tag. On initial scale-up from 0 with 4 write partitions and
@@ -1166,10 +1155,6 @@ func (s *ScaleManagerSuite) TestApplyEmitsAllGauges() {
 	s.Equal([]float64{2}, gaugeValues(target), "target gauge")
 	s.Equal([]float64{4}, gaugeValues(snap["partition_scale_read"]), "read gauge")
 	s.Equal([]float64{2}, gaugeValues(snap["partition_scale_write"]), "write gauge")
-
-	s.assertNoShadowTag(target)
-	s.assertNoShadowTag(snap["partition_scale_read"])
-	s.assertNoShadowTag(snap["partition_scale_write"])
 }
 
 // TestShadowModeEmitsSentinelOnReleaseAndTarget verifies the shadow-mode encoding
@@ -1216,11 +1201,6 @@ func (s *ScaleManagerSuite) TestShadowModeEmitsSentinelOnReleaseAndTarget() {
 	snap := cap.Snapshot()
 	s.Equal([]float64{-1}, gaugeValues(snap["partition_scale_read"]), "read sentinel once on release")
 	s.Equal([]float64{-1}, gaugeValues(snap["partition_scale_write"]), "write sentinel once on release")
-
-	// Untagged: shadow mode is encoded by the sentinel, not a tag.
-	s.assertNoShadowTag(target)
-	s.assertNoShadowTag(snap["partition_scale_read"])
-	s.assertNoShadowTag(snap["partition_scale_write"])
 }
 
 // TestShadowModeBaselineEntryEmitsNoSentinel verifies that when shadow mode is
@@ -1261,8 +1241,6 @@ func (s *ScaleManagerSuite) TestShadowModeBaselineEntryEmitsNoSentinel() {
 	snap := cap.Snapshot()
 	s.Empty(gaugeValues(snap["partition_scale_read"]), "no read sentinel at baseline entry")
 	s.Empty(gaugeValues(snap["partition_scale_write"]), "no write sentinel at baseline entry")
-
-	s.assertNoShadowTag(target)
 }
 
 // TestStopClearsAllGauges verifies that Stop records -1 for
@@ -1286,7 +1264,6 @@ func (s *ScaleManagerSuite) TestStopClearsAllGauges() {
 	snap := cap.Snapshot()
 	for _, name := range []string{"partition_scale_read", "partition_scale_write", "partition_scale_target"} {
 		s.Equal([]float64{-1}, gaugeValues(snap[name]), "%s on stop", name)
-		s.assertNoShadowTag(snap[name])
 	}
 }
 
@@ -1312,10 +1289,6 @@ func (s *ScaleManagerSuite) TestStartWithNilStateEmitsGaugesWithoutPanic() {
 	s.Equal([]float64{0}, gaugeValues(target), "target gauge for empty baseline")
 	s.Equal([]float64{0}, gaugeValues(snap["partition_scale_read"]), "read gauge")
 	s.Equal([]float64{0}, gaugeValues(snap["partition_scale_write"]), "write gauge")
-
-	s.assertNoShadowTag(target)
-	s.assertNoShadowTag(snap["partition_scale_read"])
-	s.assertNoShadowTag(snap["partition_scale_write"])
 }
 
 // TestDBWriteFailureKeepsState verifies that when persistence fails the

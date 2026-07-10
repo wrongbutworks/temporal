@@ -17,6 +17,8 @@ import (
 	"go.temporal.io/server/common/persistence/sql/sqlplugin/mysql"
 	"go.temporal.io/server/common/persistence/visibility/manager"
 	"go.temporal.io/server/common/persistence/visibility/store"
+	"go.temporal.io/server/common/searchattribute"
+	"go.temporal.io/server/common/searchattribute/sadefs"
 	"go.uber.org/mock/gomock"
 )
 
@@ -42,6 +44,40 @@ var (
 
 func TestVisibilityManagerSuite(t *testing.T) {
 	suite.Run(t, new(VisibilityManagerSuite))
+}
+
+func TestConvertToChasmExecutionInfoExecutionTime(t *testing.T) {
+	executionTime := time.Date(2026, 7, 10, 12, 0, 0, 0, time.UTC)
+	testCases := []struct {
+		name          string
+		executionTime time.Time
+		wantPresent   bool
+	}{
+		{name: "nonzero", executionTime: executionTime, wantPresent: true},
+		{name: "zero"},
+	}
+
+	visibilityManager := &visibilityManagerImpl{
+		searchAttributesMapperProvider: searchattribute.NewTestMapperProvider(nil),
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			info, err := visibilityManager.convertToChasmExecutionInfo(&store.InternalExecutionInfo{
+				StartTime:        executionTime.Add(-time.Minute),
+				ExecutionTime:    tc.executionTime,
+				SearchAttributes: &commonpb.SearchAttributes{},
+			}, nil, testNamespace)
+			require.NoError(t, err)
+
+			payload, ok := info.GetChasmSearchAttributes().GetIndexedFields()[sadefs.ExecutionTime]
+			require.Equal(t, tc.wantPresent, ok)
+			if tc.wantPresent {
+				value, err := sadefs.DecodeValue(payload, enumspb.INDEXED_VALUE_TYPE_DATETIME, false)
+				require.NoError(t, err)
+				require.Equal(t, tc.executionTime, value)
+			}
+		})
+	}
 }
 
 func (s *VisibilityManagerSuite) SetupTest() {

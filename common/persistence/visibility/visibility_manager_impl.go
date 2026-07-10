@@ -212,6 +212,12 @@ func (p *visibilityManagerImpl) convertToChasmExecutionInfo(
 			enumspb.INDEXED_VALUE_TYPE_KEYWORD,
 		)
 	}
+	if !exec.ExecutionTime.IsZero() {
+		chasmAliasedSAs.IndexedFields[sadefs.ExecutionTime] = sadefs.MustEncodeValue(
+			exec.ExecutionTime,
+			enumspb.INDEXED_VALUE_TYPE_DATETIME,
+		)
+	}
 
 	customAliasedSAs, err := searchattribute.AliasFields(
 		p.searchAttributesMapperProvider,

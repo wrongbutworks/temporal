@@ -431,15 +431,21 @@ func (t *visibilityQueueTaskExecutor) processChasmTask(
 	}
 
 	var chasmTaskQueue string
+	var chasmExecutionTime time.Time
 	if chasmSAProvider, ok := rootComponent.(chasm.VisibilitySearchAttributesProvider); ok {
 		for _, chasmSA := range chasmSAProvider.SearchAttributes(visTaskContext) {
-			if chasmSA.Field == sadefs.TaskQueue {
+			switch chasmSA.Field {
+			case sadefs.TaskQueue:
 				if strVal, ok := chasmSA.Value.Value().(string); ok {
 					chasmTaskQueue = strVal
 				}
-				continue
+			case sadefs.ExecutionTime:
+				if timeVal, ok := chasmSA.Value.Value().(time.Time); ok {
+					chasmExecutionTime = timeVal
+				}
+			default:
+				searchAttributes[chasmSA.Field] = chasmSA.Value.MustEncode()
 			}
-			searchAttributes[chasmSA.Field] = chasmSA.Value.MustEncode()
 		}
 	}
 
@@ -481,6 +487,11 @@ func (t *visibilityQueueTaskExecutor) processChasmTask(
 	// Override TaskQueue if provided by CHASM search attributes.
 	if chasmTaskQueue != "" {
 		requestBase.TaskQueue = chasmTaskQueue
+	}
+	// CHASM executions initialize mutable state ExecutionTime to creation time.
+	// Components may override it with their semantic execution time.
+	if !chasmExecutionTime.IsZero() {
+		requestBase.ExecutionTime = chasmExecutionTime
 	}
 
 	if mutableState.IsWorkflowExecutionRunning() {

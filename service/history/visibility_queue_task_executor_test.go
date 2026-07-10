@@ -588,7 +588,7 @@ func (s *visibilityQueueTaskExecutorSuite) TestProcessChasmTask_InvalidTask() {
 		"some random ID",
 		uuid.NewString(),
 	)
-	mutableState := s.buildChasmMutableState(key, 5)
+	mutableState := s.buildChasmMutableState(key, 5, time.Time{})
 
 	// Case 1: invalid task with lower transition count than the state
 	visibilityTask := s.buildChasmVisTask(key, 3)
@@ -616,7 +616,8 @@ func (s *visibilityQueueTaskExecutorSuite) TestProcessChasmTask_RunningExecution
 		"some random ID",
 		uuid.NewString(),
 	)
-	mutableState := s.buildChasmMutableState(key, 5)
+	// Simulate a component whose semantic ExecutionTime is later than its creation time (i.e., start delay in SAA)
+	mutableState := s.buildChasmMutableState(key, 5, s.now.Add(90*time.Minute))
 
 	visibilityTask := s.buildChasmVisTask(key, 5)
 
@@ -625,6 +626,10 @@ func (s *visibilityQueueTaskExecutorSuite) TestProcessChasmTask_RunningExecution
 		func(ctx context.Context, request *manager.UpsertWorkflowExecutionRequest) error {
 
 			s.Len(request.SearchAttributes.IndexedFields, 2)
+			s.True(s.now.Add(90*time.Minute).Equal(request.ExecutionTime),
+				"expected ExecutionTime override, got %v", request.ExecutionTime)
+			_, hasExecutionTimeSA := request.SearchAttributes.IndexedFields[sadefs.ExecutionTime]
+			s.False(hasExecutionTimeSA, "ExecutionTime must not be stored in the search attribute blob")
 
 			v, ok := request.SearchAttributes.IndexedFields[sadefs.TemporalNamespaceDivision]
 			s.True(ok)
@@ -667,7 +672,8 @@ func (s *visibilityQueueTaskExecutorSuite) TestProcessChasmTask_ClosedExecution(
 		"some random ID",
 		uuid.NewString(),
 	)
-	mutableState := s.buildChasmMutableState(key, 5)
+	mutableState := s.buildChasmMutableState(key, 5, time.Time{})
+	expectedExecutionTime := mutableState.ExecutionInfo.ExecutionTime.AsTime()
 
 	closeTime := s.now.Add(5 * time.Minute)
 	mutableState.ExecutionInfo.CloseTime = timestamppb.New(closeTime)
@@ -680,6 +686,8 @@ func (s *visibilityQueueTaskExecutorSuite) TestProcessChasmTask_ClosedExecution(
 	s.mockVisibilityMgr.EXPECT().RecordWorkflowExecutionClosed(gomock.Any(), gomock.Any()).DoAndReturn(
 		func(ctx context.Context, request *manager.RecordWorkflowExecutionClosedRequest) error {
 			s.True(closeTime.Equal(request.CloseTime))
+			s.True(expectedExecutionTime.Equal(request.ExecutionTime),
+				"expected base ExecutionTime to be preserved, got %v", request.ExecutionTime)
 			s.NotEmpty(request.ExecutionDuration)
 			s.Zero(request.HistoryLength)
 			s.Zero(request.HistorySizeBytes)
@@ -697,6 +705,7 @@ func (s *visibilityQueueTaskExecutorSuite) TestProcessChasmTask_ClosedExecution(
 func (s *visibilityQueueTaskExecutorSuite) buildChasmMutableState(
 	key definition.WorkflowKey,
 	visComponentTransitionCount int64,
+	chasmExecutionTime time.Time,
 ) *persistencespb.WorkflowMutableState {
 	executionInfo := &persistencespb.WorkflowExecutionInfo{
 		NamespaceId:    s.namespaceID.String(),
@@ -726,6 +735,13 @@ func (s *visibilityQueueTaskExecutorSuite) buildChasmMutableState(
 	s.True(ok)
 	visComponentTypeID, ok := s.mockShard.ChasmRegistry().ComponentIDFor(&chasm.Visibility{})
 	s.True(ok)
+	testComponentInfo := &persistencespb.ActivityInfo{
+		Paused:     true,
+		ActivityId: key.RunID,
+	}
+	if !chasmExecutionTime.IsZero() {
+		testComponentInfo.ScheduledTime = timestamppb.New(chasmExecutionTime)
+	}
 
 	chasmNodes := map[string]*persistencespb.ChasmNode{
 		"": {
@@ -738,10 +754,7 @@ func (s *visibilityQueueTaskExecutorSuite) buildChasmMutableState(
 					},
 				},
 			},
-			Data: newTestComponentStateBlob(&persistencespb.ActivityInfo{
-				Paused:     true,
-				ActivityId: key.RunID,
-			}),
+			Data: newTestComponentStateBlob(testComponentInfo),
 		},
 		"Visibility": {
 			Metadata: &persistencespb.ChasmNodeMetadata{

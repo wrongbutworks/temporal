@@ -2073,9 +2073,13 @@ func (l *testComponent) Terminate(
 }
 
 func (l *testComponent) SearchAttributes(_ chasm.Context) []chasm.SearchAttributeKeyValue {
-	return []chasm.SearchAttributeKeyValue{
+	sas := []chasm.SearchAttributeKeyValue{
 		testComponentPausedSearchAttribute.Value(l.ActivityInfo.Paused),
 	}
+	if l.ActivityInfo.GetScheduledTime() != nil {
+		sas = append(sas, chasm.SearchAttributeExecutionTime.Value(l.ActivityInfo.GetScheduledTime().AsTime()))
+	}
+	return sas
 }
 
 func (l *testComponent) Memo(_ chasm.Context) proto.Message {
